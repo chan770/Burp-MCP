@@ -23,9 +23,11 @@ sniper fuzzing, import custom BCheck scan checks, rewrite live traffic, and more
 | **Custom checks** | `import_bcheck` — load a BCheck at runtime; runs on subsequent audits |
 | **Live traffic** | request & response `*_match_replace_rule` (add/list/clear); `add_request_header` / `list` / `clear` (global header injection); live intercept queue (`intercept_queue_enable`, `intercept_queue_list`, `intercept_forward`, `intercept_drop`); `list_websockets`, `send_web_socket_message` |
 | **Session/state** | `get_cookies`, `set_cookie`, plus a registered "MCP injected headers" session-handling action |
-| **Analysis** | `compare_responses` (variant/invariant attributes) |
+| **Analysis** | `compare_responses` (attributes), `compare_responses_keywords` (keywords) |
 | **Throughput** | `batch_send` — send many URLs in parallel |
-| **Organizer** | `send_to_organizer` |
+| **WebSockets** | `list_websockets`, `send_web_socket_message` (proxied); `create_web_socket`, `send_active_web_socket_message` (new/active) |
+| **Organizer / history** | `send_to_organizer`, `annotate_history` (note + highlight) |
+| **Misc** | `burp_info`, `random_bytes`, `random_number` |
 | **Decoder** | `hex`, `html`, `gzip`, `deflate` encode/decode; `hash_digest` (MD5/SHA-*); `json_pretty` / `json_minify`; `json_read` / `json_edit` (path-based); `jwt_decode` |
 
 All of the stock server's tools (proxy history, HTTP/1.1 & HTTP/2 send, repeater/intruder

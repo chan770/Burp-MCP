@@ -41,7 +41,11 @@ import burp.api.montoya.proxy.websocket.ProxyWebSocketCreationHandler
 import burp.api.montoya.proxy.websocket.ProxyWebSocketCreation
 import burp.api.montoya.proxy.websocket.ProxyWebSocket
 import burp.api.montoya.websocket.Direction
+import burp.api.montoya.websocket.extension.ExtensionWebSocket
+import burp.api.montoya.websocket.extension.ExtensionWebSocketCreationStatus
+import burp.api.montoya.core.HighlightColor
 import kotlinx.serialization.json.JsonElement
+import java.time.ZonedDateTime
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -594,8 +598,14 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         "Exports all current scanner issues to an HTML or XML report file at the given absolute path. format: HTML or XML."
     ) {
         val fmt = if (format.equals("XML", ignoreCase = true)) ReportFormat.XML else ReportFormat.HTML
-        val issues = api.siteMap().issues()
-        if (issues.isEmpty()) return@mcpTool "No scanner issues to export."
+        val all = api.siteMap().issues()
+        val fr = filterRegex
+        val issues = if (fr.isNullOrBlank()) all else {
+            val p = runCatching { Regex(fr, RegexOption.IGNORE_CASE) }.getOrNull()
+                ?: return@mcpTool "Invalid filterRegex."
+            all.filter { p.containsMatchIn("${it.name()} ${it.baseUrl()} ${it.severity()}") }
+        }
+        if (issues.isEmpty()) return@mcpTool "No scanner issues to export (after filter)."
         api.scanner().generateReport(issues, fmt, Path.of(path))
         "Exported ${issues.size} issue(s) as ${fmt.name} to $path"
     }
@@ -730,7 +740,7 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         "Imports a BCheck script into Burp's scanner. Once imported it runs as a custom scan check on subsequent " +
                 "audits. Returns the import status and any parse errors."
     ) {
-        val result = api.scanner().bChecks().importBCheck(script)
+        val result = api.scanner().bChecks().importBCheck(script, enabled)
         val errors = result.importErrors()
         buildString {
             append("BCheck import status: ").append(result.status())
@@ -888,9 +898,15 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         if (cookies.isEmpty()) "Cookie jar is empty."
         else cookies.joinToString("\n") { "${it.name()}=${it.value()} ; domain=${it.domain()} ; path=${it.path()}" }
     }
-    mcpTool<SetCookie>("Adds/updates a cookie in Burp's cookie jar (session cookie; no expiry).") {
-        api.http().cookieJar().setCookie(name, value, path ?: "/", domain, null)
-        "Set cookie $name for domain $domain."
+    mcpTool<SetCookie>(
+        "Adds/updates a cookie in Burp's cookie jar. expiry is optional ISO-8601 " +
+                "(e.g. 2027-01-01T00:00:00Z); omit for a session cookie."
+    ) {
+        val exp = expiry?.takeIf { it.isNotBlank() }?.let {
+            runCatching { ZonedDateTime.parse(it) }.getOrNull()
+        }
+        api.http().cookieJar().setCookie(name, value, path ?: "/", domain, exp)
+        "Set cookie $name for domain $domain" + if (exp != null) " (expires $exp)." else " (session)."
     }
 
     // ---------------- Response comparison (partial Comparer) ----------------
@@ -1014,6 +1030,75 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             else -> "Unknown operation '$operation' (use add|update|remove)"
         }
     }
+
+    // ---------------- Active WebSocket (open a new connection) ----------------
+    mcpTool<CreateWebSocket>(
+        "Opens a NEW WebSocket to a target (not just proxied ones) and optionally sends an initial text message. " +
+                "Returns a websocket id for send_active_websocket_message."
+    ) {
+        val service = HttpService.httpService(host, port, tls)
+        val allowed = runBlocking { HttpRequestSecurity.checkHttpRequestPermission(host, port, config, "GET $path", api) }
+        if (!allowed) return@mcpTool "WebSocket to $host:$port denied by Burp Suite"
+        val creation = api.websockets().createWebSocket(service, path)
+        if (creation.status() != ExtensionWebSocketCreationStatus.SUCCESS || creation.webSocket().isEmpty) {
+            return@mcpTool "WebSocket creation failed: ${creation.status()}"
+        }
+        val ws = creation.webSocket().get()
+        val id = ActiveWebSockets.add("$host:$port$path", ws)
+        if (!message.isNullOrEmpty()) ws.sendTextMessage(message)
+        "Opened active WebSocket #$id to $host:$port$path" + if (!message.isNullOrEmpty()) " and sent initial message." else "."
+    }
+    mcpTool<SendActiveWebSocketMessage>("Sends a text message on an active (extension-created) WebSocket by id.") {
+        val ws = ActiveWebSockets.get(id) ?: return@mcpTool "No active WebSocket #$id"
+        ws.sendTextMessage(message)
+        "Sent ${message.length}-char message on active WebSocket #$id."
+    }
+
+    // ---------------- Response comparison by keywords ----------------
+    mcpTool<CompareResponsesKeywords>(
+        "Fetches each URL and reports which of the given keywords vary vs stay constant across responses " +
+                "(keywords comma-separated). Complements compare_responses."
+    ) {
+        val urlList = url.split(Regex("[,\\n]+")).map { it.trim() }.filter { it.isNotEmpty() }
+        val kw = keywords.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        if (urlList.size < 2 || kw.isEmpty()) return@mcpTool "Provide >=2 URLs and >=1 keyword."
+        val analyzer = api.http().createResponseKeywordsAnalyzer(kw)
+        var count = 0
+        for (u in urlList) {
+            api.http().sendRequest(HttpRequest.httpRequestFromUrl(u)).response()?.let { analyzer.updateWith(it); count++ }
+        }
+        "Compared $count responses for keywords $kw.\nVariant (present in some, not others): ${analyzer.variantKeywords()}\n" +
+                "Invariant (same across all): ${analyzer.invariantKeywords()}"
+    }
+
+    // ---------------- Annotate proxy history ----------------
+    mcpTool<AnnotateHistory>(
+        "Adds a note and/or highlight color to a proxy-history item by index (from get_proxy_http_history). " +
+                "color: NONE|RED|ORANGE|YELLOW|GREEN|CYAN|BLUE|PINK|MAGENTA|GRAY."
+    ) {
+        val history = api.proxy().history()
+        if (index < 0 || index >= history.size) return@mcpTool "No history item #$index (size ${history.size})."
+        val ann = history[index].annotations()
+        val c = color
+        if (!note.isNullOrBlank()) ann.setNotes(note)
+        if (!c.isNullOrBlank()) runCatching { ann.setHighlightColor(HighlightColor.valueOf(c.uppercase())) }
+        "Annotated history #$index (${history[index].request().url()})."
+    }
+
+    // ---------------- Burp info + random ----------------
+    mcpTool("burp_info", "Returns Burp Suite version, edition and build info.") {
+        val v = api.burpSuite().version()
+        "${v.name()} ${v.major()}.${v.minor()} (build ${v.build()}, #${v.buildNumber()}) — ${v.edition()}"
+    }
+    mcpTool<RandomBytes>("Generates N cryptographically-random bytes, returned as hex.") {
+        val b = ByteArray(length.coerceIn(1, 4096))
+        java.security.SecureRandom().nextBytes(b)
+        b.joinToString("") { "%02x".format(it) }
+    }
+    mcpTool<RandomNumber>("Returns a random integer in [min, max].") {
+        if (max < min) return@mcpTool "max must be >= min."
+        (min + java.security.SecureRandom().nextInt((max - min) + 1)).toString()
+    }
 }
 
 fun getActiveEditor(api: MontoyaApi): JTextArea? {
@@ -1096,7 +1181,7 @@ data class StartCrawl(val url: String)
 data class StartPassiveScan(val url: String)
 
 @Serializable
-data class ExportScanReport(val path: String, val format: String)
+data class ExportScanReport(val path: String, val format: String, val filterRegex: String? = null)
 
 @Serializable
 data class GetSiteMap(val prefix: String? = null, override val count: Int, override val offset: Int) : Paginated
@@ -1142,7 +1227,7 @@ data class GzipCompress(val content: String)
 data class GzipDecompress(val content: String)
 
 @Serializable
-data class ImportBcheck(val script: String)
+data class ImportBcheck(val script: String, val enabled: Boolean = true)
 
 @Serializable
 data class AddMatchReplaceRule(val match: String, val replace: String)
@@ -1196,7 +1281,10 @@ data class InterceptDrop(val id: Int)
 data class SendWebSocketMessage(val id: Int, val direction: String, val message: String)
 
 @Serializable
-data class SetCookie(val name: String, val value: String, val domain: String, val path: String? = null)
+data class SetCookie(
+    val name: String, val value: String, val domain: String,
+    val path: String? = null, val expiry: String? = null
+)
 
 @Serializable
 data class CompareResponses(val url: String)
@@ -1230,6 +1318,39 @@ data class JsonRead(val json: String, val path: String)
 
 @Serializable
 data class JsonEdit(val json: String, val path: String, val operation: String, val value: String? = null)
+
+@Serializable
+data class CreateWebSocket(
+    val host: String, val port: Int, val path: String,
+    val tls: Boolean = false, val message: String? = null
+)
+
+@Serializable
+data class SendActiveWebSocketMessage(val id: Int, val message: String)
+
+@Serializable
+data class CompareResponsesKeywords(val url: String, val keywords: String)
+
+@Serializable
+data class AnnotateHistory(val index: Int, val note: String? = null, val color: String? = null)
+
+@Serializable
+data class RandomBytes(val length: Int)
+
+@Serializable
+data class RandomNumber(val min: Int, val max: Int)
+
+/** Extension-created (active) WebSockets, addressable by id. */
+object ActiveWebSockets {
+    private val sockets = ConcurrentHashMap<Int, Pair<String, ExtensionWebSocket>>()
+    private val counter = AtomicInteger()
+    fun add(url: String, ws: ExtensionWebSocket): Int {
+        val id = counter.incrementAndGet()
+        sockets[id] = url to ws
+        return id
+    }
+    fun get(id: Int): ExtensionWebSocket? = sockets[id]?.second
+}
 
 /** Regex match-and-replace rules applied to proxied responses. */
 object ResponseMatchReplaceRules {
