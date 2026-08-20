@@ -25,9 +25,12 @@ sniper fuzzing, import custom BCheck scan checks, rewrite live traffic, and more
 | **Session/state** | `get_cookies`, `set_cookie`, plus a registered "MCP injected headers" session-handling action |
 | **Analysis** | `compare_responses` (attributes), `compare_responses_keywords` (keywords) |
 | **Throughput** | `batch_send` — send many URLs in parallel |
-| **WebSockets** | `list_websockets`, `send_web_socket_message` (proxied); `create_web_socket`, `send_active_web_socket_message` (new/active) |
+| **WebSockets** | `list_websockets`, `send_web_socket_message`, `create_web_socket`, `send_active_web_socket_message`, `get_web_socket_messages` (read captured traffic) |
+| **Scanner events** | `get_new_scanner_issues` (issues since last poll) |
 | **Organizer / history** | `send_to_organizer`, `annotate_history` (note + highlight) |
-| **Misc** | `burp_info`, `random_bytes`, `random_number` |
+| **Data / parsing** | `parse_request`, `base64url_encode/decode`, `json_validate`, `regex_extract`, `text_diff`, `convert_number`, `string_transform` |
+| **Persistence** | `kv_set` / `kv_get` / `kv_list` / `kv_delete` (project or user scope) |
+| **Engine / misc** | `pause_tasks`, `resume_tasks`, `burp_info`, `burp_command_line`, `burp_shutdown`, `random_bytes`, `random_number` |
 | **Decoder** | `hex`, `html`, `gzip`, `deflate` encode/decode; `hash_digest` (MD5/SHA-*); `json_pretty` / `json_minify`; `json_read` / `json_edit` (path-based); `jwt_decode` |
 
 All of the stock server's tools (proxy history, HTTP/1.1 & HTTP/2 send, repeater/intruder

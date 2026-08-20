@@ -44,6 +44,17 @@ import burp.api.montoya.websocket.Direction
 import burp.api.montoya.websocket.extension.ExtensionWebSocket
 import burp.api.montoya.websocket.extension.ExtensionWebSocketCreationStatus
 import burp.api.montoya.core.HighlightColor
+import burp.api.montoya.proxy.websocket.ProxyMessageHandler
+import burp.api.montoya.proxy.websocket.InterceptedTextMessage
+import burp.api.montoya.proxy.websocket.InterceptedBinaryMessage
+import burp.api.montoya.proxy.websocket.TextMessageReceivedAction
+import burp.api.montoya.proxy.websocket.TextMessageToBeSentAction
+import burp.api.montoya.proxy.websocket.BinaryMessageReceivedAction
+import burp.api.montoya.proxy.websocket.BinaryMessageToBeSentAction
+import burp.api.montoya.websocket.TextMessage
+import burp.api.montoya.websocket.BinaryMessage
+import burp.api.montoya.websocket.extension.ExtensionWebSocketMessageHandler
+import burp.api.montoya.scanner.audit.AuditIssueHandler
 import kotlinx.serialization.json.JsonElement
 import java.time.ZonedDateTime
 import java.util.concurrent.CompletableFuture
@@ -217,10 +228,36 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
             ProxyResponseToBeSentAction.continueWith(r)
     })
 
-    // Track proxied WebSockets so tools can send messages on them.
+    // Track proxied WebSockets so tools can send AND read messages on them.
     api.proxy().registerWebSocketCreationHandler(object : ProxyWebSocketCreationHandler {
         override fun handleWebSocketCreation(creation: ProxyWebSocketCreation) {
-            WebSockets.add(creation.upgradeRequest().url(), creation.proxyWebSocket())
+            val url = creation.upgradeRequest().url()
+            val id = WebSockets.add(url, creation.proxyWebSocket())
+            creation.proxyWebSocket().registerProxyMessageHandler(object : ProxyMessageHandler {
+                override fun handleTextMessageReceived(m: InterceptedTextMessage): TextMessageReceivedAction {
+                    WsMessages.add(id, m.direction().toString(), m.payload())
+                    return TextMessageReceivedAction.continueWith(m.payload())
+                }
+                override fun handleTextMessageToBeSent(m: InterceptedTextMessage): TextMessageToBeSentAction {
+                    WsMessages.add(id, m.direction().toString(), m.payload())
+                    return TextMessageToBeSentAction.continueWith(m.payload())
+                }
+                override fun handleBinaryMessageReceived(m: InterceptedBinaryMessage): BinaryMessageReceivedAction {
+                    WsMessages.add(id, m.direction().toString(), "[binary ${m.payload().length()} bytes]")
+                    return BinaryMessageReceivedAction.continueWith(m.payload())
+                }
+                override fun handleBinaryMessageToBeSent(m: InterceptedBinaryMessage): BinaryMessageToBeSentAction {
+                    WsMessages.add(id, m.direction().toString(), "[binary ${m.payload().length()} bytes]")
+                    return BinaryMessageToBeSentAction.continueWith(m.payload())
+                }
+            })
+        }
+    })
+
+    // Capture new scanner issues as they are raised, for get_new_scanner_issues.
+    api.scanner().registerAuditIssueHandler(object : AuditIssueHandler {
+        override fun handleNewAuditIssue(issue: AuditIssue) {
+            NewIssues.add("${issue.severity()} | ${issue.name()} | ${issue.baseUrl()}")
         }
     })
 
@@ -1045,6 +1082,14 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         }
         val ws = creation.webSocket().get()
         val id = ActiveWebSockets.add("$host:$port$path", ws)
+        ws.registerMessageHandler(object : ExtensionWebSocketMessageHandler {
+            override fun textMessageReceived(m: TextMessage) {
+                WsMessages.add(id, m.direction().toString(), m.payload())
+            }
+            override fun binaryMessageReceived(m: BinaryMessage) {
+                WsMessages.add(id, m.direction().toString(), "[binary ${m.payload().length()} bytes]")
+            }
+        })
         if (!message.isNullOrEmpty()) ws.sendTextMessage(message)
         "Opened active WebSocket #$id to $host:$port$path" + if (!message.isNullOrEmpty()) " and sent initial message." else "."
     }
@@ -1098,6 +1143,141 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     mcpTool<RandomNumber>("Returns a random integer in [min, max].") {
         if (max < min) return@mcpTool "max must be >= min."
         (min + java.security.SecureRandom().nextInt((max - min) + 1)).toString()
+    }
+
+    // ---------------- Task engine convenience ----------------
+    mcpTool("pause_tasks", "Pauses Burp's task execution engine (scans, crawls, etc.).") {
+        api.burpSuite().taskExecutionEngine().state = PAUSED
+        "Task execution engine paused."
+    }
+    mcpTool("resume_tasks", "Resumes Burp's task execution engine.") {
+        api.burpSuite().taskExecutionEngine().state = RUNNING
+        "Task execution engine running."
+    }
+
+    // ---------------- String / number helpers ----------------
+    mcpTool<StringTransform>(
+        "Transforms text. operation: upper | lower | reverse | trim | length | ascii_to_hex | hex_to_ascii."
+    ) {
+        when (operation.lowercase()) {
+            "upper" -> text.uppercase()
+            "lower" -> text.lowercase()
+            "reverse" -> text.reversed()
+            "trim" -> text.trim()
+            "length" -> text.length.toString()
+            "ascii_to_hex" -> api.utilities().stringUtils().convertAsciiToHexString(text)
+            "hex_to_ascii" -> api.utilities().stringUtils().convertHexStringToAscii(text)
+            else -> "Unknown operation (use upper|lower|reverse|trim|length|ascii_to_hex|hex_to_ascii)."
+        }
+    }
+    mcpTool<ConvertNumber>("Converts an integer between bases. from/to are radixes: 2, 8, 10 or 16.") {
+        val v = runCatching { value.trim().removePrefix("0x").toLong(from) }.getOrNull()
+            ?: return@mcpTool "Could not parse '$value' in base $from."
+        v.toString(to)
+    }
+
+    // ---------------- Persistent key/value store ----------------
+    mcpTool<KvSet>("Stores a string under a key in Burp persistence. scope: project (default, saved in the project) or user (cross-project).") {
+        if (scope.equals("user", true)) api.persistence().preferences().setString(key, value)
+        else api.persistence().extensionData().setString(key, value)
+        "Stored '$key' in ${if (scope.equals("user", true)) "user" else "project"} scope."
+    }
+    mcpTool<KvGet>("Reads a stored string by key. scope: project (default) or user.") {
+        val v = if (scope.equals("user", true)) api.persistence().preferences().getString(key)
+        else api.persistence().extensionData().getString(key)
+        v ?: "(no value for '$key')"
+    }
+    mcpTool<KvList>("Lists stored string keys. scope: project (default) or user.") {
+        val keys = if (scope.equals("user", true)) api.persistence().preferences().stringKeys()
+        else api.persistence().extensionData().stringKeys()
+        if (keys.isEmpty()) "No keys." else keys.sorted().joinToString("\n")
+    }
+    mcpTool<KvDelete>("Deletes a stored string by key. scope: project (default) or user.") {
+        if (scope.equals("user", true)) api.persistence().preferences().setString(key, "")
+        else api.persistence().extensionData().deleteString(key)
+        "Deleted '$key' from ${if (scope.equals("user", true)) "user" else "project"} scope."
+    }
+
+    // ---------------- Small utilities ----------------
+    mcpTool<JsonValidate>("Checks whether a string is valid JSON.") {
+        "Valid JSON: ${api.utilities().jsonUtils().isValidJson(content)}"
+    }
+    mcpTool("burp_command_line", "Returns the command-line arguments Burp was launched with.") {
+        val args = api.burpSuite().commandLineArguments()
+        if (args.isEmpty()) "(none)" else args.joinToString(" ")
+    }
+    mcpTool<RegexExtract>("Extracts all matches of a Java regex from text. If group>0, returns that capture group per match.") {
+        val p = runCatching { Regex(pattern) }.getOrNull() ?: return@mcpTool "Invalid regex."
+        val matches = p.findAll(text).map { m ->
+            if (group > 0) m.groupValues.getOrNull(group) ?: "" else m.value
+        }.toList()
+        if (matches.isEmpty()) "No matches." else matches.joinToString("\n")
+    }
+    mcpTool<TextDiff>("Line-based diff of two texts. Lines only in 'a' are prefixed '-', only in 'b' '+'.") {
+        val la = a.lines(); val lb = b.lines()
+        val sb = StringBuilder()
+        for (i in 0 until maxOf(la.size, lb.size)) {
+            val x = la.getOrNull(i); val y = lb.getOrNull(i)
+            if (x == y) continue
+            if (x != null) sb.append("- ").append(x).append('\n')
+            if (y != null) sb.append("+ ").append(y).append('\n')
+        }
+        if (sb.isEmpty()) "Identical." else sb.toString()
+    }
+    mcpTool<LogMessage>("Writes a message to Burp's extension output log.") {
+        api.logging().logToOutput(message)
+        "Logged to Burp output."
+    }
+
+    // ---------------- WebSocket message reading ----------------
+    mcpTool<GetWebSocketMessages>(
+        "Returns captured WebSocket messages (both proxied and active), newest last. Optionally filter by websocket id."
+    ) {
+        val msgs = WsMessages.list(id)
+        if (msgs.isEmpty()) "No WebSocket messages captured." + (id?.let { " for #$it" } ?: "")
+        else msgs.joinToString("\n") { "#${it.first} ${it.second}: ${it.third}" }
+    }
+
+    // ---------------- Event-captured scanner issues ----------------
+    mcpTool("get_new_scanner_issues", "Returns scanner issues raised since the last call to this tool, then clears the buffer.") {
+        val drained = NewIssues.drain()
+        if (drained.isEmpty()) "No new issues since last check." else drained.joinToString("\n")
+    }
+
+    // ---------------- base64url + request parsing ----------------
+    mcpTool<Base64UrlEncode>("Base64URL-encodes text (no padding) — the JWT/URL-safe variant.") {
+        java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(content.toByteArray(Charsets.UTF_8))
+    }
+    mcpTool<Base64UrlDecode>("Base64URL-decodes text to UTF-8.") {
+        String(java.util.Base64.getUrlDecoder().decode(content.trim()), Charsets.UTF_8)
+    }
+    mcpTool<ParseRequest>(
+        "Parses a raw HTTP request into method, path, headers, parameters and body. Provide host/port/tls for context."
+    ) {
+        val service = HttpService.httpService(host, port, tls)
+        val req = HttpRequest.httpRequest(service, normalizeHttpContent(raw))
+        buildString {
+            append("Method: ").append(req.method()).append('\n')
+            append("Path: ").append(req.path()).append('\n')
+            append("URL: ").append(req.url()).append("\n\nParameters:\n")
+            val ps = req.parameters()
+            if (ps.isEmpty()) append("  (none)\n")
+            else ps.forEach { append("  [${it.type()}] ${it.name()} = ${it.value()}\n") }
+            append("\nHeaders:\n")
+            req.headers().forEach { append("  ${it.name()}: ${it.value()}\n") }
+            val body = req.bodyToString()
+            if (body.isNotEmpty()) append("\nBody:\n").append(body)
+        }
+    }
+
+    // ---------------- Shutdown (dangerous) ----------------
+    mcpTool<BurpShutdown>(
+        "DANGEROUS: shuts down Burp Suite. Requires confirm=true. This also stops the MCP server/connection."
+    ) {
+        if (!confirm) return@mcpTool "Refused. Pass confirm=true to actually shut down Burp Suite."
+        api.logging().logToOutput("MCP shutdown requested via burp_shutdown")
+        api.burpSuite().shutdown()
+        "Shutting down Burp Suite."
     }
 }
 
@@ -1339,6 +1519,69 @@ data class RandomBytes(val length: Int)
 
 @Serializable
 data class RandomNumber(val min: Int, val max: Int)
+
+@Serializable
+data class StringTransform(val text: String, val operation: String)
+
+@Serializable
+data class ConvertNumber(val value: String, val from: Int, val to: Int)
+
+@Serializable
+data class BurpShutdown(val confirm: Boolean = false)
+
+@Serializable
+data class KvSet(val key: String, val value: String, val scope: String? = null)
+
+@Serializable
+data class KvGet(val key: String, val scope: String? = null)
+
+@Serializable
+data class KvList(val scope: String? = null)
+
+@Serializable
+data class KvDelete(val key: String, val scope: String? = null)
+
+@Serializable
+data class JsonValidate(val content: String)
+
+@Serializable
+data class RegexExtract(val text: String, val pattern: String, val group: Int = 0)
+
+@Serializable
+data class TextDiff(val a: String, val b: String)
+
+@Serializable
+data class LogMessage(val message: String)
+
+@Serializable
+data class GetWebSocketMessages(val id: Int? = null)
+
+@Serializable
+data class Base64UrlEncode(val content: String)
+
+@Serializable
+data class Base64UrlDecode(val content: String)
+
+@Serializable
+data class ParseRequest(val raw: String, val host: String, val port: Int, val tls: Boolean = true)
+
+/** Captured WebSocket messages (id, direction, payload), capped. */
+object WsMessages {
+    private val messages = mutableListOf<Triple<Int, String, String>>()
+    @Synchronized fun add(id: Int, direction: String, payload: String) {
+        messages.add(Triple(id, direction, payload))
+        if (messages.size > 2000) messages.removeAt(0)
+    }
+    @Synchronized fun list(id: Int?): List<Triple<Int, String, String>> =
+        if (id == null) messages.toList() else messages.filter { it.first == id }
+}
+
+/** New scanner issues raised since the last drain. */
+object NewIssues {
+    private val issues = mutableListOf<String>()
+    @Synchronized fun add(summary: String) { issues.add(summary) }
+    @Synchronized fun drain(): List<String> { val c = issues.toList(); issues.clear(); return c }
+}
 
 /** Extension-created (active) WebSockets, addressable by id. */
 object ActiveWebSockets {
