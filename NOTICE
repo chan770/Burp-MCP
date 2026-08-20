@@ -1,0 +1,20 @@
+Burp-MCP
+========
+
+This product is a derivative work built on top of:
+
+    PortSwigger MCP Server (mcp-server)
+    Copyright (c) PortSwigger Ltd.
+    https://github.com/PortSwigger/mcp-server
+    Licensed under the GNU General Public License v3.0 (GPLv3).
+
+The original project provides the Burp Suite Montoya extension, the embedded
+ktor server, the io.modelcontextprotocol Kotlin SDK MCP transport (SSE + stdio
+proxy), the Claude Desktop installer, and the original MCP tool set.
+
+Modifications in this repository (additional MCP tools for scanning, site map,
+scope, sniper fuzzing, BCheck import, proxy match-and-replace, header injection,
+and extra codecs) are also released under GPLv3, as required by the upstream
+license. All upstream copyright notices are retained.
+
+Full credit and thanks to PortSwigger.
