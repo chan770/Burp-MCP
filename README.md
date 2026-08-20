@@ -17,12 +17,14 @@ sniper fuzzing, import custom BCheck scan checks, rewrite live traffic, and more
 
 | Area | Added tools |
 |------|-------------|
-| **Scanner** | `start_active_scan`, `start_passive_scan`, `start_crawl`, `scan_status`, `export_scan_report` (HTML/XML) |
+| **Scanner** | `start_active_scan`, `start_passive_scan`, `start_crawl`, `crawl_and_audit`, `audit_site_map`, `scan_status`, `export_scan_report` (HTML/XML), `report_issue` |
 | **Target** | `get_site_map`, `add_to_site_map`, `scope_add`, `scope_remove`, `scope_check` |
 | **Intruder** | `run_intruder_attack` — real sniper fuzzing (marker + payloads → status/length/time per request) |
 | **Custom checks** | `import_bcheck` — load a BCheck at runtime; runs on subsequent audits |
-| **Live traffic** | `add_match_replace_rule` / `list` / `clear`; `add_request_header` / `list` / `clear` (global header injection) |
-| **Decoder** | `hex_encode` / `hex_decode`, `html_encode` / `html_decode`, `gzip_compress` / `gzip_decompress` |
+| **Live traffic** | request & response `*_match_replace_rule` (add/list/clear); `add_request_header` / `list` / `clear` (global header injection); live intercept queue (`intercept_queue_enable`, `intercept_queue_list`, `intercept_forward`, `intercept_drop`); `list_websockets`, `send_web_socket_message` |
+| **Session/state** | `get_cookies`, `set_cookie`, plus a registered "MCP injected headers" session-handling action |
+| **Analysis** | `compare_responses` (variant/invariant attributes) |
+| **Decoder** | `hex`, `html`, `gzip`, `deflate` encode/decode; `hash_digest` (MD5/SHA-*); `json_pretty` / `json_minify` |
 
 All of the stock server's tools (proxy history, HTTP/1.1 & HTTP/2 send, repeater/intruder
 hand-off, collaborator, encoders, options, editor) remain available.

@@ -24,6 +24,28 @@ import burp.api.montoya.http.handler.HttpRequestToBeSent
 import burp.api.montoya.http.handler.HttpResponseReceived
 import burp.api.montoya.http.handler.RequestToBeSentAction
 import burp.api.montoya.http.handler.ResponseReceivedAction
+import burp.api.montoya.proxy.http.ProxyResponseHandler
+import burp.api.montoya.proxy.http.ProxyResponseReceivedAction
+import burp.api.montoya.proxy.http.ProxyResponseToBeSentAction
+import burp.api.montoya.proxy.http.InterceptedResponse
+import burp.api.montoya.http.message.responses.HttpResponse
+import burp.api.montoya.http.message.HttpRequestResponse
+import burp.api.montoya.scanner.audit.issues.AuditIssue
+import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity
+import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence
+import burp.api.montoya.utilities.DigestAlgorithm
+import burp.api.montoya.http.sessions.SessionHandlingAction
+import burp.api.montoya.http.sessions.ActionResult
+import burp.api.montoya.http.sessions.SessionHandlingActionData
+import burp.api.montoya.proxy.websocket.ProxyWebSocketCreationHandler
+import burp.api.montoya.proxy.websocket.ProxyWebSocketCreation
+import burp.api.montoya.proxy.websocket.ProxyWebSocket
+import burp.api.montoya.websocket.Direction
+import kotlinx.serialization.json.JsonElement
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import io.modelcontextprotocol.kotlin.sdk.server.Server
 import java.nio.file.Path
 import kotlinx.coroutines.runBlocking
@@ -129,8 +151,21 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
     // --- Live traffic modifiers: proxy match-and-replace + global header injection.
     // Rules are managed by the tools below; empty registries are a no-op.
     api.proxy().registerRequestHandler(object : ProxyRequestHandler {
-        override fun handleRequestReceived(r: InterceptedRequest): ProxyRequestReceivedAction =
-            ProxyRequestReceivedAction.continueWith(r)
+        override fun handleRequestReceived(r: InterceptedRequest): ProxyRequestReceivedAction {
+            if (!InterceptQueue.enabled) return ProxyRequestReceivedAction.continueWith(r)
+            // Park the message and block this proxy thread until an MCP tool decides.
+            val pending = InterceptQueue.add(r)
+            val decision = try {
+                pending.future.get(120, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                InterceptQueue.remove(pending.id)
+                InterceptDecision.Forward(r)
+            }
+            return when (decision) {
+                is InterceptDecision.Drop -> ProxyRequestReceivedAction.drop()
+                is InterceptDecision.Forward -> ProxyRequestReceivedAction.continueWith(decision.request)
+            }
+        }
 
         override fun handleRequestToBeSent(r: InterceptedRequest): ProxyRequestToBeSentAction {
             val rules = MatchReplaceRules.all()
@@ -160,6 +195,39 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
 
         override fun handleHttpResponseReceived(r: HttpResponseReceived): ResponseReceivedAction =
             ResponseReceivedAction.continueWith(r)
+    })
+
+    // Response match-and-replace on proxied responses.
+    api.proxy().registerResponseHandler(object : ProxyResponseHandler {
+        override fun handleResponseReceived(r: InterceptedResponse): ProxyResponseReceivedAction {
+            val rules = ResponseMatchReplaceRules.all()
+            if (rules.isEmpty()) return ProxyResponseReceivedAction.continueWith(r)
+            var text = r.toString()
+            for ((match, replace) in rules) {
+                text = try { Regex(match).replace(text, replace) } catch (e: Exception) { text }
+            }
+            return ProxyResponseReceivedAction.continueWith(HttpResponse.httpResponse(text))
+        }
+
+        override fun handleResponseToBeSent(r: InterceptedResponse): ProxyResponseToBeSentAction =
+            ProxyResponseToBeSentAction.continueWith(r)
+    })
+
+    // Track proxied WebSockets so tools can send messages on them.
+    api.proxy().registerWebSocketCreationHandler(object : ProxyWebSocketCreationHandler {
+        override fun handleWebSocketCreation(creation: ProxyWebSocketCreation) {
+            WebSockets.add(creation.upgradeRequest().url(), creation.proxyWebSocket())
+        }
+    })
+
+    // A Burp session-handling action that re-applies the MCP-injected headers.
+    api.http().registerSessionHandlingAction(object : SessionHandlingAction {
+        override fun name(): String = "MCP injected headers"
+        override fun performAction(data: SessionHandlingActionData): ActionResult {
+            var req = data.request()
+            for ((n, v) in InjectedHeaders.all()) req = req.withUpdatedHeader(n, v)
+            return ActionResult.actionResult(req)
+        }
     })
 
     mcpTool<SendHttp1Request>("Issues an HTTP/1.1 request and returns the response.") {
@@ -709,6 +777,170 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         InjectedHeaders.clear()
         "Cleared $n injected header(s)."
     }
+
+    // ---------------- Scanner: audit site map + combined + custom issue ----------------
+    mcpTool<AuditSiteMap>(
+        "Starts an active audit of every request currently in the site map (optionally in-scope only). " +
+                "Run start_crawl first to populate the site map."
+    ) {
+        val audit = api.scanner().startAudit(
+            AuditConfiguration.auditConfiguration(BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS)
+        )
+        var n = 0
+        for (rr in api.siteMap().requestResponses()) {
+            val url = rr.request().url()
+            if (inScopeOnly && !api.scope().isInScope(url)) continue
+            audit.addRequest(rr.request()); n++
+        }
+        val id = ScanRegistry.add("audit-sitemap", "$n entries", audit)
+        "Started audit #$id of $n site-map entries. Poll scan_status; read get_scanner_issues."
+    }
+
+    mcpTool<CrawlAndAudit>(
+        "Convenience: starts a crawl from the seed URL, then you audit the discovered content with audit_site_map " +
+                "once the crawl finishes (Montoya has no single combined call)."
+    ) {
+        val crawl = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(url))
+        val id = ScanRegistry.add("crawl", url, crawl)
+        "Started crawl #$id from $url. When scan_status shows it finished, call audit_site_map to audit everything found."
+    }
+
+    mcpTool<ReportIssue>(
+        "Adds a custom audit issue to the site map. severity: HIGH|MEDIUM|LOW|INFORMATION; " +
+                "confidence: CERTAIN|FIRM|TENTATIVE."
+    ) {
+        val sev = runCatching { AuditIssueSeverity.valueOf(severity.uppercase()) }.getOrDefault(AuditIssueSeverity.INFORMATION)
+        val conf = runCatching { AuditIssueConfidence.valueOf(confidence.uppercase()) }.getOrDefault(AuditIssueConfidence.TENTATIVE)
+        val issue = AuditIssue.auditIssue(
+            name, detail, "", baseUrl, sev, conf, "", "", sev, emptyList<HttpRequestResponse>()
+        )
+        api.siteMap().add(issue)
+        "Added issue '$name' ($sev/$conf) at $baseUrl to the site map."
+    }
+
+    // ---------------- Proxy: response match-and-replace ----------------
+    mcpTool<AddResponseMatchReplaceRule>(
+        "Adds a regex match-and-replace rule applied to proxied responses (server -> browser). " +
+                "match is a Java regex over the full response text; replace supports \$1 groups."
+    ) {
+        ResponseMatchReplaceRules.add(match, replace)
+        "Added response rule #${ResponseMatchReplaceRules.all().size}: /$match/ -> \"$replace\"."
+    }
+    mcpTool("list_response_match_replace_rules", "Lists active response match-and-replace rules.") {
+        val rules = ResponseMatchReplaceRules.all()
+        if (rules.isEmpty()) "No response match-and-replace rules."
+        else rules.mapIndexed { i, (m, r) -> "#${i + 1}: /$m/ -> \"$r\"" }.joinToString("\n")
+    }
+    mcpTool("clear_response_match_replace_rules", "Removes all response match-and-replace rules.") {
+        val n = ResponseMatchReplaceRules.all().size
+        ResponseMatchReplaceRules.clear()
+        "Cleared $n response rule(s)."
+    }
+
+    // ---------------- Proxy: live intercept queue ----------------
+    mcpTool<InterceptQueueEnable>(
+        "Enables or disables the MCP intercept queue. When enabled, proxied requests are paused and must be " +
+                "released with intercept_forward or intercept_drop (auto-forwarded after 120s)."
+    ) {
+        InterceptQueue.enabled = enabled
+        if (!enabled) InterceptQueue.releaseAllForward()
+        "Intercept queue " + if (enabled) "ENABLED (requests will pause)." else "DISABLED (pending released)."
+    }
+    mcpTool("intercept_queue_list", "Lists paused requests waiting in the intercept queue.") {
+        val pending = InterceptQueue.list()
+        if (pending.isEmpty()) "No paused requests."
+        else pending.joinToString("\n\n") { "#${it.id} ${it.summary}\n${it.request}" }
+    }
+    mcpTool<InterceptForward>(
+        "Forwards a paused request by id. Optionally provide modified raw request content to replace it."
+    ) {
+        val p = InterceptQueue.get(id) ?: return@mcpTool "No paused request #$id"
+        val request = if (content.isNullOrBlank()) p.request
+        else HttpRequest.httpRequest(p.request.httpService(), normalizeHttpContent(content))
+        InterceptQueue.resolve(id, InterceptDecision.Forward(request))
+        "Forwarded request #$id" + if (content.isNullOrBlank()) "." else " (modified)."
+    }
+    mcpTool<InterceptDrop>("Drops a paused request by id.") {
+        if (InterceptQueue.get(id) == null) return@mcpTool "No paused request #$id"
+        InterceptQueue.resolve(id, InterceptDecision.Drop)
+        "Dropped request #$id."
+    }
+
+    // ---------------- WebSockets ----------------
+    mcpTool("list_websockets", "Lists proxied WebSocket connections seen since load.") {
+        val ws = WebSockets.list()
+        if (ws.isEmpty()) "No WebSocket connections observed."
+        else ws.joinToString("\n") { "#${it.first}: ${it.second}" }
+    }
+    mcpTool<SendWebSocketMessage>(
+        "Sends a text message on a proxied WebSocket by id. direction: to_server (client->server) or to_client."
+    ) {
+        val ws = WebSockets.get(id) ?: return@mcpTool "No WebSocket #$id"
+        val dir = if (direction.equals("to_client", true) || direction.equals("server_to_client", true))
+            Direction.SERVER_TO_CLIENT else Direction.CLIENT_TO_SERVER
+        ws.sendTextMessage(message, dir)
+        "Sent ${message.length}-char message on WebSocket #$id ($dir)."
+    }
+
+    // ---------------- Cookie jar ----------------
+    mcpTool("get_cookies", "Lists cookies in Burp's cookie jar.") {
+        val cookies = api.http().cookieJar().cookies()
+        if (cookies.isEmpty()) "Cookie jar is empty."
+        else cookies.joinToString("\n") { "${it.name()}=${it.value()} ; domain=${it.domain()} ; path=${it.path()}" }
+    }
+    mcpTool<SetCookie>("Adds/updates a cookie in Burp's cookie jar (session cookie; no expiry).") {
+        api.http().cookieJar().setCookie(name, value, path ?: "/", domain, null)
+        "Set cookie $name for domain $domain."
+    }
+
+    // ---------------- Response comparison (partial Comparer) ----------------
+    mcpTool<CompareResponses>(
+        "Fetches each URL and reports which response attributes vary vs stay invariant across them " +
+                "(status, length, word/line counts, etc.) — useful for oracle/diffing."
+    ) {
+        val urls = url.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        if (urls.size < 2) return@mcpTool "Provide at least two comma-separated URLs."
+        val analyzer = api.http().createResponseVariationsAnalyzer()
+        var count = 0
+        for (u in urls) {
+            val allowed = runBlocking {
+                val req = HttpRequest.httpRequestFromUrl(u)
+                HttpRequestSecurity.checkHttpRequestPermission(req.httpService().host(), req.httpService().port(), config, req.toString(), api)
+            }
+            if (!allowed) continue
+            api.http().sendRequest(HttpRequest.httpRequestFromUrl(u)).response()?.let { analyzer.updateWith(it); count++ }
+        }
+        "Compared $count responses.\nVariant attributes: ${analyzer.variantAttributes()}\n" +
+                "Invariant attributes: ${analyzer.invariantAttributes()}"
+    }
+
+    // ---------------- Codecs: deflate, hashes, JSON ----------------
+    mcpTool<DeflateCompress>("Deflate-compresses text and returns base64.") {
+        val c = api.utilities().compressionUtils()
+            .compress(burp.api.montoya.core.ByteArray.byteArray(content), CompressionType.DEFLATE)
+        api.utilities().base64Utils().encodeToString(c)
+    }
+    mcpTool<DeflateDecompress>("Deflate-decompresses base64 data and returns text.") {
+        val raw = api.utilities().base64Utils().decode(content)
+        api.utilities().compressionUtils().decompress(raw, CompressionType.DEFLATE).toString()
+    }
+    mcpTool<HashDigest>(
+        "Computes a cryptographic digest of the input. algorithm e.g. MD5, SHA_1, SHA_256, SHA_512. Returns hex."
+    ) {
+        val algo = runCatching { DigestAlgorithm.valueOf(algorithm.uppercase().replace("-", "_")) }
+            .getOrDefault(DigestAlgorithm.SHA_256)
+        val digest = api.utilities().cryptoUtils()
+            .generateDigest(burp.api.montoya.core.ByteArray.byteArray(content), algo)
+        (0 until digest.length()).joinToString("") { "%02x".format(digest.getByte(it)) }
+    }
+    mcpTool<JsonPretty>("Pretty-prints (indents) a JSON string.") {
+        val el = Json.parseToJsonElement(content)
+        Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), el)
+    }
+    mcpTool<JsonMinify>("Minifies a JSON string (removes whitespace).") {
+        val el = Json.parseToJsonElement(content)
+        Json.encodeToString(JsonElement.serializer(), el)
+    }
 }
 
 fun getActiveEditor(api: MontoyaApi): JTextArea? {
@@ -862,6 +1094,116 @@ object InjectedHeaders {
     }
     @Synchronized fun all(): List<Pair<String, String>> = headers.toList()
     @Synchronized fun clear() { headers.clear() }
+}
+
+@Serializable
+data class AuditSiteMap(val inScopeOnly: Boolean = false)
+
+@Serializable
+data class CrawlAndAudit(val url: String)
+
+@Serializable
+data class ReportIssue(
+    val name: String, val detail: String, val severity: String, val confidence: String, val baseUrl: String
+)
+
+@Serializable
+data class AddResponseMatchReplaceRule(val match: String, val replace: String)
+
+@Serializable
+data class InterceptQueueEnable(val enabled: Boolean)
+
+@Serializable
+data class InterceptForward(val id: Int, val content: String? = null)
+
+@Serializable
+data class InterceptDrop(val id: Int)
+
+@Serializable
+data class SendWebSocketMessage(val id: Int, val direction: String, val message: String)
+
+@Serializable
+data class SetCookie(val name: String, val value: String, val domain: String, val path: String? = null)
+
+@Serializable
+data class CompareResponses(val url: String)
+
+@Serializable
+data class DeflateCompress(val content: String)
+
+@Serializable
+data class DeflateDecompress(val content: String)
+
+@Serializable
+data class HashDigest(val algorithm: String, val content: String)
+
+@Serializable
+data class JsonPretty(val content: String)
+
+@Serializable
+data class JsonMinify(val content: String)
+
+/** Regex match-and-replace rules applied to proxied responses. */
+object ResponseMatchReplaceRules {
+    private val rules = mutableListOf<Pair<String, String>>()
+    @Synchronized fun add(match: String, replace: String) { rules.add(match to replace) }
+    @Synchronized fun all(): List<Pair<String, String>> = rules.toList()
+    @Synchronized fun clear() { rules.clear() }
+}
+
+sealed class InterceptDecision {
+    data class Forward(val request: burp.api.montoya.http.message.requests.HttpRequest) : InterceptDecision()
+    object Drop : InterceptDecision()
+}
+
+/** Holds proxied requests paused for manual forward/drop over MCP. */
+object InterceptQueue {
+    @Volatile var enabled = false
+
+    class Pending(
+        val id: Int,
+        val summary: String,
+        val request: burp.api.montoya.http.message.requests.HttpRequest,
+        val future: CompletableFuture<InterceptDecision>
+    )
+
+    private val pending = ConcurrentHashMap<Int, Pending>()
+    private val counter = AtomicInteger()
+
+    fun add(request: burp.api.montoya.http.message.requests.HttpRequest): Pending {
+        val id = counter.incrementAndGet()
+        val p = Pending(id, "${request.method()} ${request.url()}", request, CompletableFuture())
+        pending[id] = p
+        return p
+    }
+
+    fun list(): List<Pending> = pending.values.sortedBy { it.id }
+    fun get(id: Int): Pending? = pending[id]
+    fun remove(id: Int) { pending.remove(id) }
+
+    fun resolve(id: Int, decision: InterceptDecision): Boolean {
+        val p = pending.remove(id) ?: return false
+        p.future.complete(decision)
+        return true
+    }
+
+    fun releaseAllForward() {
+        pending.values.toList().forEach { it.future.complete(InterceptDecision.Forward(it.request)) }
+        pending.clear()
+    }
+}
+
+/** Tracks proxied WebSocket connections so tools can send messages. */
+object WebSockets {
+    private val sockets = ConcurrentHashMap<Int, Pair<String, ProxyWebSocket>>()
+    private val counter = AtomicInteger()
+    fun add(url: String, ws: ProxyWebSocket): Int {
+        val id = counter.incrementAndGet()
+        sockets[id] = url to ws
+        return id
+    }
+    fun get(id: Int): ProxyWebSocket? = sockets[id]?.second
+    fun list(): List<Pair<Int, String>> = sockets.entries.sortedBy { it.key }.map { it.key to it.value.first }
 }
 
 /** Tracks scan/crawl tasks started this session so scan_status can report on them. */
