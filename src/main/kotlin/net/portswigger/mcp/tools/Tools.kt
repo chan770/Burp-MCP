@@ -941,6 +941,79 @@ fun Server.registerTools(api: MontoyaApi, config: McpConfig) {
         val el = Json.parseToJsonElement(content)
         Json.encodeToString(JsonElement.serializer(), el)
     }
+
+    // ---------------- Batch send (parallel) ----------------
+    mcpTool<BatchSend>(
+        "Sends many URLs in parallel through Burp and returns status + length per URL " +
+                "(comma- or newline-separated). Much faster than sending one at a time."
+    ) {
+        val list = urls.split(Regex("[,\\n]+")).map { it.trim() }.filter { it.isNotEmpty() }
+        if (list.isEmpty()) return@mcpTool "No URLs provided."
+        val requests = mutableListOf<HttpRequest>()
+        val kept = mutableListOf<String>()
+        for (u in list) {
+            val req = HttpRequest.httpRequestFromUrl(u)
+            val ok = runBlocking {
+                HttpRequestSecurity.checkHttpRequestPermission(req.httpService().host(), req.httpService().port(), config, req.toString(), api)
+            }
+            if (ok) { requests.add(req); kept.add(u) }
+        }
+        if (requests.isEmpty()) return@mcpTool "All URLs denied by Burp Suite."
+        val start = System.currentTimeMillis()
+        val results = api.http().sendRequests(requests)
+        val ms = System.currentTimeMillis() - start
+        val rows = results.mapIndexed { i, rr ->
+            "${kept.getOrElse(i) { "?" }} -> ${rr.response()?.statusCode() ?: "-"} " +
+                    "(${rr.response()?.toByteArray()?.length() ?: 0} bytes)"
+        }
+        "Sent ${requests.size} request(s) in ${ms}ms:\n" + rows.joinToString("\n")
+    }
+
+    // ---------------- Organizer ----------------
+    mcpTool<SendToOrganizer>("Fetches a URL and sends its request/response to Burp's Organizer, with an optional note.") {
+        val req = HttpRequest.httpRequestFromUrl(url)
+        val ok = runBlocking {
+            HttpRequestSecurity.checkHttpRequestPermission(req.httpService().host(), req.httpService().port(), config, req.toString(), api)
+        }
+        if (!ok) return@mcpTool "Request to $url denied by Burp Suite"
+        var rr = api.http().sendRequest(req)
+        if (!note.isNullOrBlank()) rr = rr.withAnnotations(rr.annotations().withNotes(note))
+        api.organizer().sendToOrganizer(rr)
+        "Sent $url to Organizer" + if (note.isNullOrBlank()) "." else " with note."
+    }
+
+    // ---------------- JWT ----------------
+    mcpTool<JwtDecode>(
+        "Decodes a JWT: base64url-decodes the header and payload. Does NOT verify the signature."
+    ) {
+        val parts = token.trim().split(".")
+        if (parts.size < 2) return@mcpTool "Not a JWT (expected header.payload.signature)."
+        fun dec(s: String): String = try {
+            String(java.util.Base64.getUrlDecoder().decode(s), Charsets.UTF_8)
+        } catch (e: Exception) { "<decode error: ${e.message}>" }
+        buildString {
+            append("HEADER:\n").append(dec(parts[0])).append("\n\n")
+            append("PAYLOAD:\n").append(dec(parts[1]))
+            if (parts.size > 2) append("\n\nSIGNATURE (base64url, not verified):\n").append(parts[2])
+        }
+    }
+
+    // ---------------- JSON path read/edit ----------------
+    mcpTool<JsonRead>("Reads a value from a JSON string at the given path using Burp's jsonUtils (e.g. path 'user.id').") {
+        api.utilities().jsonUtils().read(json, path) ?: "(no value at '$path')"
+    }
+    mcpTool<JsonEdit>(
+        "Edits a JSON string using Burp's jsonUtils. operation: add | update | remove. " +
+                "value is required for add and update."
+    ) {
+        val u = api.utilities().jsonUtils()
+        when (operation.lowercase()) {
+            "add" -> u.add(json, path, value ?: "")
+            "update" -> u.update(json, path, value ?: "")
+            "remove" -> u.remove(json, path)
+            else -> "Unknown operation '$operation' (use add|update|remove)"
+        }
+    }
 }
 
 fun getActiveEditor(api: MontoyaApi): JTextArea? {
@@ -1142,6 +1215,21 @@ data class JsonPretty(val content: String)
 
 @Serializable
 data class JsonMinify(val content: String)
+
+@Serializable
+data class BatchSend(val urls: String)
+
+@Serializable
+data class SendToOrganizer(val url: String, val note: String? = null)
+
+@Serializable
+data class JwtDecode(val token: String)
+
+@Serializable
+data class JsonRead(val json: String, val path: String)
+
+@Serializable
+data class JsonEdit(val json: String, val path: String, val operation: String, val value: String? = null)
 
 /** Regex match-and-replace rules applied to proxied responses. */
 object ResponseMatchReplaceRules {

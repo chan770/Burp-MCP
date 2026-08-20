@@ -24,7 +24,9 @@ sniper fuzzing, import custom BCheck scan checks, rewrite live traffic, and more
 | **Live traffic** | request & response `*_match_replace_rule` (add/list/clear); `add_request_header` / `list` / `clear` (global header injection); live intercept queue (`intercept_queue_enable`, `intercept_queue_list`, `intercept_forward`, `intercept_drop`); `list_websockets`, `send_web_socket_message` |
 | **Session/state** | `get_cookies`, `set_cookie`, plus a registered "MCP injected headers" session-handling action |
 | **Analysis** | `compare_responses` (variant/invariant attributes) |
-| **Decoder** | `hex`, `html`, `gzip`, `deflate` encode/decode; `hash_digest` (MD5/SHA-*); `json_pretty` / `json_minify` |
+| **Throughput** | `batch_send` — send many URLs in parallel |
+| **Organizer** | `send_to_organizer` |
+| **Decoder** | `hex`, `html`, `gzip`, `deflate` encode/decode; `hash_digest` (MD5/SHA-*); `json_pretty` / `json_minify`; `json_read` / `json_edit` (path-based); `jwt_decode` |
 
 All of the stock server's tools (proxy history, HTTP/1.1 & HTTP/2 send, repeater/intruder
 hand-off, collaborator, encoders, options, editor) remain available.
